@@ -1,7 +1,11 @@
 import logging
+import json
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from typing import Dict, Any, List
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from app.config import settings
 
 # Setup logging
@@ -11,9 +15,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger("digital-twin-autopilot")
 
+USER_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "user_config.json",
+)
+
+# In-memory states for Dashboard (resets on reload, dev only)
+active_platforms = ["telegram", "discord", "gmail"]
+mock_activities = [
+    {
+        "id": 1,
+        "platform": "telegram",
+        "sender": "Ananya",
+        "query": "Bro are you free tonight?",
+        "reply": "yeah probably, just chilling at home. what's up?",
+        "verified": True,
+        "timestamp": "Just now",
+    },
+    {
+        "id": 2,
+        "platform": "discord",
+        "sender": "CodeRebel_9",
+        "query": "Hey did you run the latest migration?",
+        "reply": "idk about that one, ask the sysops lead",
+        "verified": False,
+        "timestamp": "5 mins ago",
+    },
+    {
+        "id": 3,
+        "platform": "gmail",
+        "sender": "hiring@innovate.co",
+        "query": "Hello, we reviewed your autopilot profile and wanted to follow up.",
+        "reply": "Dear sender,\n\nThank you for reaching out. I appreciate the follow-up.\n\nBest regards,",
+        "verified": True,
+        "timestamp": "20 mins ago",
+    },
+]
+
+mock_approvals = [
+    {
+        "id": "appr_1",
+        "sender": "Manoj Kumar",
+        "platform": "telegram",
+        "query": "Which college did you study in?",
+        "ai_reply": "i studied at National Institute of Technology, i think?",
+        "confidence": 0.42,
+        "timestamp": "10 mins ago",
+    },
+    {
+        "id": "appr_2",
+        "sender": "boss@innovate.co",
+        "platform": "gmail",
+        "query": "Please forward the Q2 performance logs.",
+        "ai_reply": "Dear sender,\n\nI will send the logs to you shortly.\n\nBest regards,",
+        "confidence": 0.35,
+        "timestamp": "1 hour ago",
+    },
+]
+
+
+def load_user_config() -> Dict[str, Any]:
+    """Helper to load config preferences from local json storage."""
+    if os.path.exists(USER_CONFIG_PATH):
+        try:
+            with open(USER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading user_config.json: {e}")
+    # Default config schema template
+    return {
+        "name": "User",
+        "formality_level": settings.FORMALITY_LEVEL,
+        "reply_delay_min": settings.REPLY_DELAY_MIN,
+        "reply_delay_max": settings.REPLY_DELAY_MAX,
+    }
+
+
+def save_user_config(config_data: Dict[str, Any]):
+    """Helper to save config preferences to local json storage."""
+    try:
+        os.makedirs(os.path.dirname(USER_CONFIG_PATH), exist_ok=True)
+        with open(USER_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving user_config.json: {e}")
+
 
 import asyncio
 from app.services.discord import bot_client
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,7 +113,9 @@ async def lifespan(app: FastAPI):
     discord_task = None
     if settings.DISCORD_BOT_TOKEN:
         logger.info("Starting Discord bot client...")
-        discord_task = asyncio.create_task(bot_client.start(settings.DISCORD_BOT_TOKEN))
+        discord_task = asyncio.create_task(
+            bot_client.start(settings.DISCORD_BOT_TOKEN)
+        )
     yield
     # App shutdown logic
     logger.info("Shutting down Digital Twin Autopilot Backend...")
@@ -65,3 +158,119 @@ async def health_check():
             "reply_delay_range": f"{settings.REPLY_DELAY_MIN}s - {settings.REPLY_DELAY_MAX}s",
         },
     }
+
+
+# ==========================================
+# DASHBOARD REST API ENDPOINTS
+# ==========================================
+
+
+class ConfigUpdatePayload(BaseModel):
+    name: str
+    formality_level: int
+    reply_delay_min: int
+    reply_delay_max: int
+
+
+class ApprovalActionPayload(BaseModel):
+    content: str
+
+
+@app.get("/api/stats")
+async def get_dashboard_stats():
+    return {
+        "messages_replied": len(mock_activities),
+        "avg_response_time": f"{(settings.REPLY_DELAY_MIN + settings.REPLY_DELAY_MAX) // 2}s",
+        "active_platforms": active_platforms,
+        "pending_approvals": len(mock_approvals),
+        "confidence_score": "88%",
+    }
+
+
+@app.get("/api/activity")
+async def get_dashboard_activities():
+    return mock_activities
+
+
+@app.get("/api/config")
+async def get_dashboard_config():
+    return load_user_config()
+
+
+@app.post("/api/config")
+async def update_dashboard_config(payload: ConfigUpdatePayload):
+    config_dict = payload.model_dump()
+    save_user_config(config_dict)
+
+    # Sync update parameters inside global runtime settings
+    settings.FORMALITY_LEVEL = payload.formality_level
+    settings.REPLY_DELAY_MIN = payload.reply_delay_min
+    settings.REPLY_DELAY_MAX = payload.reply_delay_max
+
+    return {"status": "updated", "config": config_dict}
+
+
+@app.post("/api/platforms/{platform}/toggle")
+async def toggle_platform_channel(platform: str):
+    if platform not in ["telegram", "discord", "gmail"]:
+        raise HTTPException(status_code=400, detail="Invalid platform channel name")
+
+    if platform in active_platforms:
+        active_platforms.remove(platform)
+        status = "disabled"
+    else:
+        active_platforms.append(platform)
+        status = "enabled"
+
+    logger.info(f"Platform channel {platform} is now {status}.")
+    return {"platform": platform, "status": status, "active_list": active_platforms}
+
+
+@app.get("/api/approvals")
+async def get_pending_approvals():
+    return mock_approvals
+
+
+@app.post("/api/approvals/{id}/approve")
+async def approve_pending_reply(id: str, payload: ApprovalActionPayload):
+    global mock_approvals
+    item = next((x for x in mock_approvals if x["id"] == id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Approval task item not found")
+
+    logger.info(
+        f"Approved reply override for {id} ({item['platform']}): {payload.content}"
+    )
+
+    # Simulate dispatch reply bubble to services in background
+    # Real pipeline will forward this payload directly
+    mock_activities.insert(
+        0,
+        {
+            "id": len(mock_activities) + 1,
+            "platform": item["platform"],
+            "sender": item["sender"],
+            "query": item["query"],
+            "reply": payload.content,
+            "verified": False,
+            "timestamp": "Just now",
+        },
+    )
+
+    # Remove from approvals
+    mock_approvals = [x for x in mock_approvals if x["id"] != id]
+    return {"status": "approved", "dispatched": payload.content}
+
+
+@app.post("/api/approvals/{id}/reject")
+async def reject_pending_reply(id: str):
+    global mock_approvals
+    item = next((x for x in mock_approvals if x["id"] == id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Approval task item not found")
+
+    logger.info(f"Rejected and discarded autopilot reply for {id}")
+
+    # Remove from approvals
+    mock_approvals = [x for x in mock_approvals if x["id"] != id]
+    return {"status": "rejected"}
